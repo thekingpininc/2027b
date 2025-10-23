@@ -1,1 +1,275 @@
-z
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Swipe Basketball – 5 Shots</title>
+  <style>
+    :root{
+      --ui:#1e40af; /* blue */
+      --bg:#f9f5e7;
+    }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple SD Gothic Neo, Noto Sans KR, sans-serif; background:#0b1020; color:#111}
+
+    .wrap{display:grid; place-items:center; min-height:100svh; padding:12px}
+
+    .game{
+      position:relative; width:min(420px, 92vw); aspect-ratio:9/16;
+      border:10px solid var(--ui); border-radius:16px; overflow:hidden; background:var(--bg);
+      box-shadow:0 12px 40px rgba(0,0,0,.35);
+      user-select:none; -webkit-user-select:none; touch-action:none; /* we'll manage gestures */
+    }
+    canvas{width:100%; height:100%; display:block; background:
+      radial-gradient(140% 70% at 50% 120%, rgba(0,0,0,.18), transparent 40%),
+      linear-gradient(180deg, #fff8e6 0%, #fff2cc 40%, #ffeab3 100%);
+    }
+
+    .hud{position:absolute; inset:8px 8px auto 8px; display:flex; gap:8px; font-weight:700}
+    .pill{background:#ffffffcc; color:#0b1020; padding:6px 10px; border-radius:999px; box-shadow:0 3px 10px rgba(0,0,0,.12)}
+
+    .btn{appearance:none; border:0; background:var(--ui); color:#fff; padding:10px 14px; border-radius:999px; font-weight:700; cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+
+    .overlay, .final{
+      position:absolute; inset:0; display:grid; place-items:center; background:rgba(10,16,32,.6); backdrop-filter:blur(3px);
+    }
+    .card{background:#fff; width:min(92%, 360px); border-radius:16px; padding:18px 16px; box-shadow:0 12px 30px rgba(0,0,0,.35); position:relative}
+    .card h2{margin:0 0 6px; font-size:20px}
+    .card p{margin:0 0 10px; line-height:1.5}
+    .card .x{position:absolute; top:10px; right:10px; width:32px; height:32px; border-radius:50%; border:0; background:#eee; font-size:18px; cursor:pointer}
+
+    .credits{position:absolute; inset:auto 10px 10px auto; font-size:12px; opacity:.6}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="game" id="game">
+      <canvas id="cv" width="360" height="640" aria-label="basketball court"></canvas>
+
+      <div class="hud">
+        <div class="pill" id="tries">남은 기회 5</div>
+        <div class="pill" id="score">성공 0</div>
+      </div>
+
+      <div class="overlay" id="intro">
+        <div class="card">
+          <button class="x" id="introClose" aria-label="닫기">×</button>
+          <h2>게임 방법</h2>
+          <p>농구공을 <b>클릭·드래그</b> 또는 <b>터치·스와이프</b>해서 위쪽 골대에 넣으세요.</p>
+          <ul>
+            <li>총 <b>5번</b>의 기회</li>
+            <li>바닥에서 공을 끌어당긴 뒤 놓으면 슛!</li>
+            <li>골대 안쪽을 통과하면 1점</li>
+          </ul>
+          <button class="btn" id="startBtn">시작하기</button>
+        </div>
+      </div>
+
+      <div class="final" id="final" hidden>
+        <div class="card">
+          <h2>게임 종료</h2>
+          <p id="finalText">성공 0 / 5</p>
+          <div style="display:flex; gap:8px; justify-content:flex-end">
+            <button class="btn" id="restartBtn">다시하기</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="credits">이미지: backboard.png, ball.png 배치</div>
+    </div>
+  </div>
+
+  <script>
+  (()=>{
+    const cv = document.getElementById('cv');
+    const ctx = cv.getContext('2d');
+    const triesEl = document.getElementById('tries');
+    const scoreEl = document.getElementById('score');
+    const intro = document.getElementById('intro');
+    const final = document.getElementById('final');
+    const finalText = document.getElementById('finalText');
+    document.getElementById('introClose').onclick = ()=> intro.style.display='none';
+    document.getElementById('startBtn').onclick = ()=> intro.style.display='none';
+    document.getElementById('restartBtn').onclick = ()=>{ resetGame(true); };
+
+    function fitDPI(){
+      const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+      const {clientWidth:w, clientHeight:h} = cv;
+      cv.width = Math.round(w*dpr);
+      cv.height = Math.round(h*dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    new ResizeObserver(fitDPI).observe(cv);
+
+    const boardImg = new Image(); boardImg.src = 'backboard.png';
+    const ballImg = new Image(); ballImg.src = 'ball.png';
+
+    const W = ()=>cv.clientWidth, H = ()=>cv.clientHeight;
+    const gravity = 2200; // px/s^2
+    const floorY = ()=> H() - 24; // floor line
+    const dragCap = 1600; // max launch speed
+    const bounce = 0.55;
+
+    function hoopRect(){
+      const w = W(), h = H();
+      const hoopW = Math.min(150, w*0.42);
+      const hoopH = 14; // rim thickness
+      const x = (w-hoopW)/2; // center
+      const y = 110; // distance from top
+      return {x, y, w:hoopW, h:hoopH};
+    }
+
+    let ball = {x: W()/2, y: floorY()-34, r: 28, vx:0, vy:0, grabbed:false, canScore:false, shotActive:false, scoredThisShot:false};
+
+    let tries = 5, score = 0, lastTime = performance.now();
+
+    function resetBall(){
+      ball.x = W()/2; ball.y = floorY()-ball.r; ball.vx = 0; ball.vy = 0;
+      ball.grabbed=false; ball.shotActive=false; ball.scoredThisShot=false; ball.canScore=true;
+    }
+    function resetGame(hard){
+      tries = 5; score = 0; updateHUD(); resetBall(); final.hidden = true; intro.style.display = hard? 'none':'grid';
+    }
+
+    function updateHUD(){
+      triesEl.textContent = `남은 기회 ${tries}`;
+      scoreEl.textContent = `성공 ${score}`;
+    }
+
+    let activePointer = null, dragStart = null;
+    cv.addEventListener('pointerdown', (e)=>{
+      if (tries<=0) return;
+      const rect = cv.getBoundingClientRect();
+      const px = (e.clientX-rect.left); const py = (e.clientY-rect.top);
+      const dx = px - ball.x, dy = py - ball.y;
+      if (dx*dx + dy*dy <= (ball.r+10)*(ball.r+10)){
+        activePointer = e.pointerId; dragStart = {x:px, y:py};
+        ball.grabbed = true; ball.vx = 0; ball.vy = 0; ball.shotActive=false; ball.scoredThisShot=false;
+        cv.setPointerCapture(activePointer);
+      }
+    });
+
+    cv.addEventListener('pointermove', (e)=>{
+      if (e.pointerId !== activePointer || !ball.grabbed) return;
+      const rect = cv.getBoundingClientRect();
+      const px = (e.clientX-rect.left); const py = (e.clientY-rect.top);
+      ball.x = px; ball.y = py; 
+    });
+
+    cv.addEventListener('pointerup', (e)=>{
+      if (e.pointerId !== activePointer) return;
+      if (ball.grabbed && dragStart){
+        const rect = cv.getBoundingClientRect();
+        const px = (e.clientX-rect.left), py = (e.clientY-rect.top);
+        let vx = (dragStart.x - px) * 8; // pull-back to set speed (bigger factor = faster)
+        let vy = (dragStart.y - py) * 8;
+        const mag = Math.hypot(vx, vy);
+        const s = Math.min(1, dragCap / (mag || 1));
+        ball.vx = vx * s; ball.vy = vy * s; 
+        ball.grabbed = false; ball.shotActive = true; ball.canScore = true; ball.scoredThisShot=false;
+        activePointer = null; dragStart = null; cv.releasePointerCapture(e.pointerId);
+      }
+    });
+
+    function physics(dt){
+      if (!ball.grabbed){
+        ball.vy += gravity * dt; 
+        ball.x += ball.vx * dt; ball.y += ball.vy * dt;
+
+        const w = W();
+        if (ball.x - ball.r < 0){ ball.x = ball.r; ball.vx *= -bounce; }
+        if (ball.x + ball.r > w){ ball.x = w - ball.r; ball.vx *= -bounce; }
+
+        const fy = floorY();
+        if (ball.y + ball.r > fy){ ball.y = fy - ball.r; ball.vy *= -bounce; ball.vx *= 0.98; }
+
+        const hoop = hoopRect();
+        const rimTop = hoop.y, rimBottom = hoop.y + hoop.h;
+        const rimLeft = hoop.x, rimRight = hoop.x + hoop.w;
+
+        if (ball.y + ball.r > rimTop && ball.y - ball.r < rimTop && ball.x > rimLeft && ball.x < rimRight && ball.vy>0){
+          ball.y = rimTop - ball.r; ball.vy *= -bounce; ball.vx *= 0.98; ball.canScore = true; // reset possible scoring until through
+        }
+        if (ball.y - ball.r < rimBottom && ball.y + ball.r > rimBottom && ball.x > rimLeft && ball.x < rimRight && ball.vy<0){
+          ball.y = rimBottom + ball.r; ball.vy *= -bounce; ball.vx *= 0.98; ball.canScore = false; // prevent cheap scores from below
+        }
+
+        const innerPad = Math.max(10, hoop.w*0.08);
+        const innerL = rimLeft + innerPad, innerR = rimRight - innerPad;
+        if (ball.shotActive && ball.canScore && !ball.scoredThisShot){
+          const crossed = (ball.y - ball.vy*dt) < rimTop && ball.y >= rimTop && ball.x > innerL && ball.x < innerR && ball.vy>0;
+          if (crossed){
+            score++; ball.scoredThisShot = true; updateHUD();
+          }
+        }
+
+        const speed = Math.hypot(ball.vx, ball.vy);
+        if (ball.shotActive && ( (Math.abs(ball.y + ball.r - fy) < 2 && speed < 60) || ball.y - ball.r > H()+40 )){
+          tries--; ball.shotActive = false; if (tries<=0){ endGame(); } else { resetBall(); }
+          updateHUD();
+        }
+      }
+    }
+
+    function draw(){
+      const w = W(), h = H();
+      ctx.clearRect(0,0,w,h);
+
+      ctx.strokeStyle = 'rgba(0,0,0,.15)';
+      ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, floorY()+0.5); ctx.lineTo(w, floorY()+0.5); ctx.stroke();
+
+      const hoop = hoopRect();
+      const boardW = Math.min(w*0.78, 300); const boardH = boardW*0.6;
+      const boardX = (w-boardW)/2; const boardY = hoop.y - boardH + 8;
+      if (boardImg.complete && boardImg.naturalWidth){
+        ctx.drawImage(boardImg, boardX, boardY, boardW, boardH);
+      } else {
+        ctx.fillStyle = '#2e64ff1a'; ctx.fillRect(boardX, boardY, boardW, boardH);
+        ctx.strokeStyle = '#1e40af'; ctx.lineWidth = 4; ctx.strokeRect(boardX, boardY, boardW, boardH);
+      }
+
+      ctx.fillStyle = '#ff8a00';
+      ctx.fillRect(hoop.x, hoop.y, hoop.w, hoop.h);
+      ctx.strokeStyle = 'rgba(255,255,255,.9)';
+      ctx.lineWidth = 2;
+      for(let i=0;i<6;i++){
+        ctx.beginPath();
+        const t = i/5; const x = hoop.x + t*hoop.w;
+        ctx.moveTo(x, hoop.y+hoop.h);
+        ctx.lineTo(hoop.x + hoop.w/2, hoop.y + 70);
+        ctx.stroke();
+      }
+
+      if (ball.grabbed && dragStart){
+        ctx.strokeStyle = 'rgba(0,0,0,.3)'; ctx.setLineDash([6,6]); ctx.lineWidth = 2; ctx.beginPath();
+        ctx.moveTo(ball.x, ball.y); ctx.lineTo(dragStart.x, dragStart.y); ctx.stroke(); ctx.setLineDash([]);
+        ctx.beginPath(); ctx.arc(dragStart.x, dragStart.y, 6, 0, Math.PI*2); ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fill();
+      }
+
+      const bx = ball.x - ball.r, by = ball.y - ball.r, bs = ball.r*2;
+      if (ballImg.complete && ballImg.naturalWidth){ ctx.drawImage(ballImg, bx, by, bs, bs); }
+      else { // vector fallback
+        ctx.fillStyle = '#e67e22'; ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#1e40af'; ctx.lineWidth = 4; ctx.stroke();
+        // seams
+        ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r*0.9, 0, Math.PI*2); ctx.stroke();
+      }
+    }
+
+    function endGame(){
+      finalText.textContent = `성공 ${score} / 5`;
+      final.hidden = false;
+    }
+
+    function loop(t){
+      const dt = Math.min(0.033, (t - lastTime)/1000); lastTime = t;
+      physics(dt); draw(); requestAnimationFrame(loop);
+    }
+
+    fitDPI(); resetGame(false); updateHUD(); requestAnimationFrame(loop);
+  })();
+  </script>
+</body>
+</html>
+
